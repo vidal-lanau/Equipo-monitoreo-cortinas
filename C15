@@ -1,0 +1,213 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <SPI.h>
+#include <SD.h>
+#include <time.h>
+// =========================
+// CONFIGURACIÓN USUARIO
+// =========================
+const char* WIFI_SSID = "RFID";
+const char* WIFI_PASS = "rfid_2019";
+const char* MQTT_HOST = "f2ecc9564c2f485a95e0f8cace94f7b3.s1.eu.hivemq.cloud";
+const int   MQTT_PORT = 8883;
+const char* MQTT_USER = "devices_qlc";
+const char* MQTT_PASS = "Rosa457$";
+const char* CD_ID   = "quilicura";
+const char* DOOR_ID = "C15";
+// =========================
+// HARDWARE
+// =========================
+const int DOOR_PIN = 4;
+const bool DOOR_OPEN_LEVEL = HIGH;
+const unsigned long DEBOUNCE_MS = 50;
+const int SD_CS    = 5;
+const int SPI_SCK  = 18;
+const int SPI_MISO = 19;
+const int SPI_MOSI = 23;
+// =========================
+// ARCHIVOS SD
+// =========================
+const char* EVENTS_PATH    = "/door_events.csv";
+const char* HEARTBEAT_PATH = "/door_heartbeat.csv";
+// =========================
+// TIEMPO
+// =========================
+const long GMT_OFFSET_SEC = -3 * 3600;
+const int  DAYLIGHT_OFFSET_SEC = 0;
+const unsigned long HEARTBEAT_MS = 120000;
+// =========================
+// MQTT
+// =========================
+WiFiClientSecure net;
+PubSubClient mqtt(net);
+// =========================
+// VARIABLES
+// =========================
+bool sdOk = false;
+bool stableDoorOpen = false;
+int lastRaw = -1;
+unsigned long lastDebounceMs = 0;
+unsigned long openStartMs = 0;
+unsigned long lastHeartbeatMs = 0;
+// =========================
+// TOPICS
+// =========================
+String topicBase() { return String("alifrut/") + CD_ID + "/" + DOOR_ID; }
+String topicStatus() { return topicBase() + "/status"; }
+String topicEvent()  { return topicBase() + "/event"; }
+String topicOnline() { return topicBase() + "/online"; }
+String topicHeartbeat() { return topicBase() + "/heartbeat"; }
+// =========================
+// TIME
+// =========================
+String nowIso() {
+  time_t now;
+  time(&now);
+  if (now > 1700000000) {
+    struct tm t;
+    gmtime_r(&now, &t);
+    char buf[25];
+    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &t);
+    return String(buf);
+  }
+  return String("ms:") + String(millis());
+}
+// =========================
+// SD
+// =========================
+void ensureHeaders() {
+  if (!sdOk) return;
+  if (!SD.exists(EVENTS_PATH)) {
+    File f = SD.open(EVENTS_PATH, FILE_WRITE);
+    if (f) {
+      f.println("timestamp,ms_since_boot,event,duration_sec");
+      f.close();
+    }
+  }
+  if (!SD.exists(HEARTBEAT_PATH)) {
+    File f = SD.open(HEARTBEAT_PATH, FILE_WRITE);
+    if (f) {
+      f.println("timestamp,ms_since_boot,door_state,wifi_status,rssi");
+      f.close();
+    }
+  }
+}
+void logEvent(String event, String duration) {
+  if (!sdOk) return;
+  File f = SD.open(EVENTS_PATH, FILE_APPEND);
+  if (!f) return;
+  f.print(nowIso()); f.print(",");
+  f.print(millis()); f.print(",");
+  f.print(event); f.print(",");
+  f.println(duration);
+  f.close();
+}
+void logHeartbeat() {
+  if (!sdOk) return;
+  bool wifiUp = (WiFi.status() == WL_CONNECTED);
+  String wifiStatus = wifiUp ? "UP" : "DOWN";
+  String rssi = wifiUp ? String(WiFi.RSSI()) : "";
+  File f = SD.open(HEARTBEAT_PATH, FILE_APPEND);
+  if (!f) return;
+  f.print(nowIso()); f.print(",");
+  f.print(millis()); f.print(",");
+  f.print(stableDoorOpen ? "OPEN" : "CLOSED"); f.print(",");
+  f.print(wifiStatus); f.print(",");
+  f.println(rssi);
+  f.close();
+}
+// =========================
+// WIFI / MQTT
+// =========================
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, "pool.ntp.org");
+}
+void mqttCallback(char*, byte*, unsigned int) {}
+void connectMQTT() {
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(mqttCallback);
+  net.setInsecure();
+  while (!mqtt.connected()) {
+    String clientId = "ESP32_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+    mqtt.connect(
+      clientId.c_str(),
+      MQTT_USER,
+      MQTT_PASS,
+      topicOnline().c_str(),
+      1,
+      true,
+      "0"
+    );
+    delay(1000);
+  }
+  mqtt.publish(topicOnline().c_str(), "1", true);
+  mqtt.publish(topicStatus().c_str(), stableDoorOpen ? "OPEN" : "CLOSED", true);
+}
+// =========================
+// SETUP
+// =========================
+void setup() {
+  Serial.begin(115200);
+  pinMode(DOOR_PIN, INPUT_PULLUP);
+  lastRaw = digitalRead(DOOR_PIN);
+  stableDoorOpen = (lastRaw == DOOR_OPEN_LEVEL);
+  lastDebounceMs = millis();
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SD_CS);
+  sdOk = SD.begin(SD_CS);
+  ensureHeaders();
+  connectWiFi();
+  connectMQTT();
+}
+// =========================
+// LOOP
+// =========================
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+  if (!mqtt.connected()) connectMQTT();
+  mqtt.loop();
+  unsigned long now = millis();
+  // -------- REED CON DEBOUNCE --------
+  int raw = digitalRead(DOOR_PIN);
+  if (raw != lastRaw) {
+    lastRaw = raw;
+    lastDebounceMs = now;
+  }
+  if (now - lastDebounceMs > DEBOUNCE_MS) {
+    bool currentState = (raw == DOOR_OPEN_LEVEL);
+    if (currentState != stableDoorOpen) {
+      stableDoorOpen = currentState;
+      if (stableDoorOpen) {
+        openStartMs = now;
+        logEvent("OPEN", "");
+        mqtt.publish(topicStatus().c_str(), "OPEN", true);
+        mqtt.publish(topicEvent().c_str(), "OPEN");
+      } else {
+        unsigned long duration = (now - openStartMs) / 1000;
+        logEvent("CLOSE", String(duration));
+        mqtt.publish(topicStatus().c_str(), "CLOSED", true);
+        mqtt.publish(topicEvent().c_str(), String(duration).c_str());
+      }
+    }
+  }
+  // -------- HEARTBEAT CADA 2 MIN --------
+  if (now - lastHeartbeatMs > HEARTBEAT_MS) {
+    lastHeartbeatMs = now;
+    logHeartbeat();
+    bool wifiUp = (WiFi.status() == WL_CONNECTED);
+    String payload = "{";
+    payload += "\"ts\":\"" + nowIso() + "\",";
+    payload += "\"door\":\"" + String(stableDoorOpen ? "OPEN" : "CLOSED") + "\",";
+    payload += "\"wifi\":\"" + String(wifiUp ? "UP" : "DOWN") + "\",";
+    payload += "\"rssi\":" + String(wifiUp ? WiFi.RSSI() : 0);
+    payload += "}";
+    mqtt.publish(topicHeartbeat().c_str(), payload.c_str());
+    Serial.println("Heartbeat enviado");
+  }
+  delay(10);
+}
